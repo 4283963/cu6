@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"privacy-relay/internal/model"
+	"privacy-relay/internal/service"
 	appErr "privacy-relay/pkg/errors"
 	"privacy-relay/pkg/utils"
 )
@@ -71,6 +72,60 @@ func RequestLogger() gin.HandlerFunc {
 			"[HTTP] request_id=%s method=%s path=%s query=%s status=%d duration=%v ip=%s ua=%s req=%s resp=%s",
 			requestID, method, path, query, status, duration, clientIP, userAgent, bodyForLog, respBody,
 		)
+	}
+}
+
+func MetricsMiddleware(metrics service.MetricsCollector, skipPaths ...string) gin.HandlerFunc {
+	skipMap := make(map[string]bool)
+	for _, p := range skipPaths {
+		skipMap[p] = true
+	}
+
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if skipMap[path] {
+			c.Next()
+			return
+		}
+
+		ctx := c.Request.Context()
+		metrics.IncRequest(ctx, path)
+		metrics.IncInFlight(ctx)
+
+		c.Next()
+
+		metrics.DecInFlight(ctx)
+
+		statusCode := c.Writer.Status()
+		if len(c.Errors) > 0 {
+			lastErr := c.Errors.Last()
+			if lastErr != nil {
+				if ae, ok := lastErr.Err.(*appErr.AppError); ok {
+					metrics.IncError(ctx, path, ae.Code)
+					if ae.Code == appErr.CodeReplayAttack {
+						clientID, _ := c.Get("client_id")
+						if cid, ok := clientID.(string); ok {
+							metrics.IncReplayIntercepted(ctx, cid)
+						} else {
+							metrics.IncReplayIntercepted(ctx, "")
+						}
+					}
+					if ae.Code == appErr.CodeIdempotentLock || ae.Code == appErr.CodeConflict {
+						metrics.IncIdempotentBlocked(ctx, path)
+					}
+					return
+				}
+			}
+			metrics.IncError(ctx, path, appErr.CodeInternalError)
+			return
+		}
+
+		if statusCode >= 200 && statusCode < 400 {
+			metrics.IncSuccess(ctx, path)
+			return
+		}
+
+		metrics.IncError(ctx, path, appErr.CodeInternalError)
 	}
 }
 

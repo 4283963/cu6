@@ -74,3 +74,50 @@ type CommonResponse struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
+
+type MetricsRequest struct {
+	StartDate string `form:"start_date" binding:"omitempty,datetime=2006-01-02"`
+	EndDate   string `form:"end_date" binding:"omitempty,datetime=2006-01-02"`
+	Days      int    `form:"days" binding:"omitempty,min=1,max=365"`
+}
+
+type RealtimeMetrics struct {
+	TotalRequests      int64            `json:"total_requests"`
+	SuccessRequests    int64            `json:"success_requests"`
+	FailedRequests     int64            `json:"failed_requests"`
+	ReplayIntercepted  int64            `json:"replay_intercepted"`
+	IdempotentBlocked  int64            `json:"idempotent_blocked"`
+	RequestsInFlight   int64            `json:"requests_in_flight"`
+	SuccessRate        float64          `json:"success_rate"`
+	ErrorDistribution  map[string]int64 `json:"error_distribution"`
+	PathDistribution   map[string]int64 `json:"path_distribution"`
+	UpdatedAt          int64            `json:"updated_at"`
+}
+
+type HistoricalMetrics struct {
+	TotalRelays        int64            `json:"total_relays"`
+	SuccessRelays      int64            `json:"success_relays"`
+	FailedRelays       int64            `json:"failed_relays"`
+	RetryingRelays     int64            `json:"retrying_relays"`
+	ProcessingRelays   int64            `json:"processing_relays"`
+	PendingRelays      int64            `json:"pending_relays"`
+	ExpiredRelays      int64            `json:"expired_relays"`
+	TotalDispatches    int64            `json:"total_dispatches"`
+	SuccessRate        float64          `json:"success_rate"`
+	StatusDistribution map[string]int64 `json:"status_distribution"`
+}
+
+type DailyMetrics struct {
+	Date               string           `json:"date"`
+	TotalRelays        int64            `json:"total_relays"`
+	SuccessRelays      int64            `json:"success_relays"`
+	FailedRelays       int64            `json:"failed_relays"`
+	StatusDistribution map[string]int64 `json:"status_distribution"`
+}
+
+type MetricsResponse struct {
+	Realtime   *RealtimeMetrics   `json:"realtime"`
+	Historical *HistoricalMetrics `json:"historical"`
+	Daily      []*DailyMetrics    `json:"daily,omitempty"`
+	GeneratedAt int64             `json:"generated_at"`
+}

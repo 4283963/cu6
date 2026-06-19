@@ -9,23 +9,29 @@ import (
 )
 
 type Router struct {
-	cfg           *config.Config
-	relayHandler  *RelayHandler
-	healthHandler *HealthHandler
-	replaySvc     service.ReplayProtectionService
+	cfg            *config.Config
+	relayHandler   *RelayHandler
+	healthHandler  *HealthHandler
+	metricsHandler *MetricsHandler
+	replaySvc      service.ReplayProtectionService
+	metrics        service.MetricsCollector
 }
 
 func NewRouter(
 	cfg *config.Config,
 	relayHandler *RelayHandler,
 	healthHandler *HealthHandler,
+	metricsHandler *MetricsHandler,
 	replaySvc service.ReplayProtectionService,
+	metrics service.MetricsCollector,
 ) *Router {
 	return &Router{
-		cfg:           cfg,
-		relayHandler:  relayHandler,
-		healthHandler: healthHandler,
-		replaySvc:     replaySvc,
+		cfg:            cfg,
+		relayHandler:   relayHandler,
+		healthHandler:  healthHandler,
+		metricsHandler: metricsHandler,
+		replaySvc:      replaySvc,
+		metrics:        metrics,
 	}
 }
 
@@ -37,6 +43,13 @@ func (r *Router) SetupEngine() *gin.Engine {
 	engine.Use(gin.Recovery())
 	engine.Use(middleware.RequestLogger())
 	engine.Use(middleware.ValidateRequest())
+
+	engine.Use(middleware.MetricsMiddleware(r.metrics,
+		"/api/v1/health",
+		"/api/v1/ready",
+		"/favicon.ico",
+	))
+
 	engine.Use(middleware.ErrorHandler())
 	engine.Use(middleware.ResponseFormatter())
 
@@ -44,6 +57,9 @@ func (r *Router) SetupEngine() *gin.Engine {
 	{
 		health := apiV1.Group("")
 		r.healthHandler.RegisterRoutes(health)
+
+		metrics := apiV1.Group("")
+		r.metricsHandler.RegisterRoutes(metrics)
 
 		relayGroup := apiV1.Group("")
 		relayGroup.Use(middleware.OptionalReplayProtection(r.replaySvc, &r.cfg.Security))

@@ -46,15 +46,19 @@ func main() {
 	relayRepo := repository.NewRelayRepository(db)
 	stateRepo := repository.NewStateTransitionRepository(db)
 	replayRepo := repository.NewReplayRecordRepository(db)
+	metricsRepo := repository.NewMetricsRepository(db)
 
+	metricsCollector := service.NewMetricsCollector(redisClient, &cfg.Relay)
 	idempotentSvc := service.NewIdempotentService(redisClient, &cfg.Relay)
 	replaySvc := service.NewReplayProtectionService(redisClient, &cfg.Relay)
 	relaySvc := service.NewRelayService(cfg, relayRepo, stateRepo, replayRepo, idempotentSvc)
+	metricsSvc := service.NewMetricsService(metricsCollector, metricsRepo, relayRepo)
 
 	relayHandler := handler.NewRelayHandler(relaySvc)
 	healthHandler := handler.NewHealthHandler()
+	metricsHandler := handler.NewMetricsHandler(metricsSvc)
 
-	router := handler.NewRouter(cfg, relayHandler, healthHandler, replaySvc)
+	router := handler.NewRouter(cfg, relayHandler, healthHandler, metricsHandler, replaySvc, metricsCollector)
 	engine := router.SetupEngine()
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
