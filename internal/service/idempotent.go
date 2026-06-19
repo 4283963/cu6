@@ -23,6 +23,8 @@ type IdempotentService interface {
 	GetDispatchResult(ctx context.Context, relayID string) (string, bool, error)
 	AcquireStateLock(ctx context.Context, relayID string) (bool, string, error)
 	ReleaseStateLock(ctx context.Context, relayID, token string) error
+	PrecheckDispatch(ctx context.Context, relayID string) (*cache.DispatchPrecheckResult, error)
+	SetNextDispatchAllowed(ctx context.Context, relayID string, nextAt time.Time) error
 }
 
 type idempotentService struct {
@@ -44,6 +46,18 @@ const (
 	dispatchResultKeyPrefix = "relay:dispatch:result:"
 	stateLockKeyPrefix      = "relay:state:lock:"
 )
+
+func (s *idempotentService) PrecheckDispatch(ctx context.Context, relayID string) (*cache.DispatchPrecheckResult, error) {
+	return s.redis.CheckDispatchAllowed(ctx, relayID)
+}
+
+func (s *idempotentService) SetNextDispatchAllowed(ctx context.Context, relayID string, nextAt time.Time) error {
+	ttl := time.Until(nextAt) + s.cfg.MaxRetryBackoff
+	if ttl < s.cfg.BaseRetryBackoff*2 {
+		ttl = s.cfg.BaseRetryBackoff * 2
+	}
+	return s.redis.SetNextDispatchAllowedAt(ctx, relayID, nextAt, ttl)
+}
 
 func (s *idempotentService) AcquireRegisterLock(ctx context.Context, idempotentKey string) (bool, string, error) {
 	key := registerLockKeyPrefix + idempotentKey

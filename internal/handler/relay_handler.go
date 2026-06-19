@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -96,13 +98,45 @@ func (h *RelayHandler) DispatchDecrypt(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.relaySvc.DispatchDecrypt(c.Request.Context(), &req)
+	result, err := h.relaySvc.DispatchDecrypt(c.Request.Context(), &req)
 	if err != nil {
+		if result != nil {
+			if result.Throttled {
+				retrySec := (result.RetryAfterMs + 999) / 1000
+				if retrySec < 1 {
+					retrySec = 1
+				}
+				c.Header("Retry-After", strconv.FormatInt(retrySec, 10))
+				c.Header("X-Retry-After-Ms", strconv.FormatInt(result.RetryAfterMs, 10))
+				c.Set("response_data", gin.H{
+					"relay_id":       req.RelayID,
+					"retry_after_ms": result.RetryAfterMs,
+					"message":        fmt.Sprintf("dispatch throttled, retry after %dms", result.RetryAfterMs),
+				})
+				c.Set("response_status", http.StatusTooManyRequests)
+				c.Abort()
+				return
+			}
+			if result.AlreadyDone && result.Response != nil {
+				middleware.SetOK(c, result.Response)
+				return
+			}
+		}
+		if ae, ok := err.(*appErr.AppError); ok && ae.Code == appErr.CodeConflict {
+			if result != nil && result.Response != nil {
+				middleware.SetOK(c, result.Response)
+				return
+			}
+		}
 		middleware.SetError(c, err)
 		return
 	}
 
-	middleware.SetOK(c, resp)
+	if result != nil && result.Response != nil {
+		middleware.SetOK(c, result.Response)
+		return
+	}
+	middleware.SetOK(c, result)
 }
 
 func (h *RelayHandler) UpdateDecryptStatus(c *gin.Context) {

@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"privacy-relay/internal/cache"
 	"privacy-relay/internal/config"
 	"privacy-relay/internal/model"
 	"privacy-relay/internal/repository"
@@ -14,9 +16,16 @@ import (
 type RelayService interface {
 	RegisterRelay(ctx context.Context, req *model.RegisterRelayRequest) (*model.RegisterRelayResponse, error)
 	GetRelay(ctx context.Context, relayID string) (*model.GetRelayResponse, error)
-	DispatchDecrypt(ctx context.Context, req *model.DispatchDecryptRequest) (*model.DispatchDecryptResponse, error)
+	DispatchDecrypt(ctx context.Context, req *model.DispatchDecryptRequest) (*DispatchResult, error)
 	UpdateDecryptStatus(ctx context.Context, req *model.UpdateDecryptStatusRequest) (*model.UpdateDecryptStatusResponse, error)
 	ListRelays(ctx context.Context, req *model.ListRelaysRequest) (*model.ListRelaysResponse, error)
+}
+
+type DispatchResult struct {
+	Response     *model.DispatchDecryptResponse
+	AlreadyDone  bool
+	Throttled    bool
+	RetryAfterMs int64
 }
 
 type relayService struct {
@@ -71,7 +80,11 @@ func (s *relayService) RegisterRelay(ctx context.Context, req *model.RegisterRel
 		return nil, err
 	}
 	if !acquired {
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 		cachedRelayID, exists, err = s.idempotentSvc.GetRegisterResult(ctx, req.IdempotentKey)
 		if err == nil && exists {
 			existing, err := s.relayRepo.GetByRelayID(ctx, cachedRelayID)
@@ -160,22 +173,36 @@ func (s *relayService) GetRelay(ctx context.Context, relayID string) (*model.Get
 	return s.toGetRelayResponse(record), nil
 }
 
-func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchDecryptRequest) (*model.DispatchDecryptResponse, error) {
-	dispatchID := utils.GenerateRequestID()
-
-	cachedDispatchID, exists, err := s.idempotentSvc.GetDispatchResult(ctx, req.RelayID)
+func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchDecryptRequest) (*DispatchResult, error) {
+	precheck, err := s.idempotentSvc.PrecheckDispatch(ctx, req.RelayID)
 	if err != nil {
 		return nil, err
 	}
-	if exists {
-		record, err := s.relayRepo.GetByRelayID(ctx, req.RelayID)
-		if err == nil && record != nil && (record.Status == model.RelayStatusDistributed || record.Status == model.RelayStatusDecrypting) {
-			return &model.DispatchDecryptResponse{
-				RelayID:    req.RelayID,
-				Status:     record.Status,
-				DispatchID: cachedDispatchID,
-			}, appErr.Conflict("decrypt dispatch already processed for this relay")
+
+	if precheck.AlreadyDispatched {
+		record, dbErr := s.relayRepo.GetByRelayID(ctx, req.RelayID)
+		if dbErr == nil && record != nil &&
+			(record.Status == model.RelayStatusDistributed || record.Status == model.RelayStatusDecrypting) {
+			return &DispatchResult{
+				AlreadyDone: true,
+				Response: &model.DispatchDecryptResponse{
+					RelayID:    req.RelayID,
+					Status:     record.Status,
+					DispatchID: precheck.DispatchID,
+				},
+			}, appErr.Conflict("decrypt dispatch already processed")
 		}
+	}
+
+	if precheck.Throttled {
+		retryAfterMs := precheck.NextAllowedAtMs - time.Now().UnixMilli()
+		if retryAfterMs < 0 {
+			retryAfterMs = 0
+		}
+		return &DispatchResult{
+			Throttled:    true,
+			RetryAfterMs: retryAfterMs,
+		}, appErr.IdempotentLock(fmt.Sprintf("dispatch throttled, retry after %dms", retryAfterMs))
 	}
 
 	acquired, stateToken, err := s.idempotentSvc.AcquireStateLock(ctx, req.RelayID)
@@ -183,7 +210,10 @@ func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchD
 		return nil, err
 	}
 	if !acquired {
-		return nil, appErr.IdempotentLock("another dispatch is processing, please retry later")
+		return &DispatchResult{
+			Throttled:    true,
+			RetryAfterMs: 500,
+		}, appErr.IdempotentLock("another dispatch is processing, please retry later")
 	}
 	defer func() {
 		_ = s.idempotentSvc.ReleaseStateLock(ctx, req.RelayID, stateToken)
@@ -199,6 +229,26 @@ func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchD
 		return nil, appErr.StateTransition("relay has expired")
 	}
 
+	if s.stateMachine.IsTerminal(record.Status) {
+		return nil, appErr.Conflict("relay already in terminal state: " + string(record.Status))
+	}
+
+	if record.Status == model.RelayStatusRetrying && record.LastRetryAt != nil {
+		delay := s.backoff.NextDelay(record.RetryCount)
+		earliestAllowed := record.LastRetryAt.Add(delay)
+		if time.Now().Before(earliestAllowed) {
+			_ = s.idempotentSvc.SetNextDispatchAllowed(ctx, req.RelayID, earliestAllowed)
+			retryMs := time.Until(earliestAllowed).Milliseconds()
+			if retryMs < 0 {
+				retryMs = 0
+			}
+			return &DispatchResult{
+				Throttled:    true,
+				RetryAfterMs: retryMs,
+			}, appErr.IdempotentLock(fmt.Sprintf("retry backoff active, retry after %dms", retryMs))
+		}
+	}
+
 	allowedFromStates := []model.RelayStatus{
 		model.RelayStatusRegistered,
 		model.RelayStatusRetrying,
@@ -212,11 +262,18 @@ func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchD
 	}
 	if !fromAllowed {
 		if record.Status == model.RelayStatusDistributed || record.Status == model.RelayStatusDecrypting {
-			return nil, appErr.Conflict("relay already dispatched, status: " + string(record.Status))
+			return &DispatchResult{
+				AlreadyDone: true,
+				Response: &model.DispatchDecryptResponse{
+					RelayID: req.RelayID,
+					Status:  record.Status,
+				},
+			}, appErr.Conflict("relay already dispatched, status: " + string(record.Status))
 		}
 		return nil, appErr.StateTransition("invalid state for dispatch: " + string(record.Status))
 	}
 
+	dispatchID := utils.GenerateRequestID()
 	fromStatus := record.Status
 	now := time.Now()
 	extraUpdates := map[string]interface{}{
@@ -246,10 +303,12 @@ func (s *relayService) DispatchDecrypt(ctx context.Context, req *model.DispatchD
 		return nil, err
 	}
 
-	return &model.DispatchDecryptResponse{
-		RelayID:    req.RelayID,
-		Status:     model.RelayStatusDistributed,
-		DispatchID: dispatchID,
+	return &DispatchResult{
+		Response: &model.DispatchDecryptResponse{
+			RelayID:    req.RelayID,
+			Status:     model.RelayStatusDistributed,
+			DispatchID: dispatchID,
+		},
 	}, nil
 }
 
@@ -279,11 +338,6 @@ func (s *relayService) UpdateDecryptStatus(ctx context.Context, req *model.Updat
 	}
 
 	if req.Success {
-		if record.Status != model.RelayStatusDecrypting && record.Status != model.RelayStatusDistributed && record.Status != model.RelayStatusRetrying {
-			if err := s.transitionState(ctx, record, model.RelayStatusDecrypting, "pre_success_override", "update_system", ""); err != nil {
-				record, _ = s.relayRepo.GetByRelayID(ctx, req.RelayID)
-			}
-		}
 		now := time.Now()
 		if err := s.relayRepo.MarkSuccess(ctx, req.RelayID, req.Plaintext, now); err != nil {
 			return nil, err
@@ -336,16 +390,6 @@ func (s *relayService) UpdateDecryptStatus(ctx context.Context, req *model.Updat
 	}
 
 	fromStatus := record.Status
-	if !s.stateMachine.CanTransition(fromStatus, model.RelayStatusRetrying) {
-		if s.stateMachine.CanTransition(fromStatus, model.RelayStatusRetrying) {
-		} else {
-			if err := s.transitionState(ctx, record, model.RelayStatusRetrying, "force_retry_on_status_update", "retry_system", ""); err != nil {
-				record, _ = s.relayRepo.GetByRelayID(ctx, req.RelayID)
-				fromStatus = record.Status
-			}
-		}
-	}
-
 	extraUpdates := map[string]interface{}{
 		"retry_count":   nextRetryCount,
 		"last_error":    req.ErrorMsg,
@@ -361,9 +405,11 @@ func (s *relayService) UpdateDecryptStatus(ctx context.Context, req *model.Updat
 		ToStatus:      model.RelayStatusRetrying,
 		TriggerReason: "decrypt_failed_scheduled_retry",
 		Operator:      "retry_system",
-		Remark:        "retry=" + string(rune(nextRetryCount)) + "/" + string(rune(record.MaxRetryCount)) + " error=" + truncateString(req.ErrorMsg, 350),
+		Remark:        fmt.Sprintf("retry=%d/%d error=%s", nextRetryCount, record.MaxRetryCount, truncateString(req.ErrorMsg, 350)),
 		CreatedAt:     now,
 	})
+
+	_ = s.idempotentSvc.SetNextDispatchAllowed(ctx, req.RelayID, nextRetryAt)
 
 	return &model.UpdateDecryptStatusResponse{
 		RelayID:     req.RelayID,
@@ -449,3 +495,5 @@ func truncateString(s string, maxLen int) string {
 	}
 	return s[:maxLen-3] + "..."
 }
+
+var _ = cache.DispatchPrecheckResult{}
